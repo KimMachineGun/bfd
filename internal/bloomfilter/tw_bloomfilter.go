@@ -1,50 +1,52 @@
 package bloomfilter
 
 import (
-	"fmt"
 	"hash"
 	"sync"
 )
 
 type TermWindowedBloomFilter struct {
-	n uint64  // number of items
-	p float64 // probability of false positives
-	m uint64  // number of bits
-	k uint64  // number of hash functions
+	n         uint64  // number of items
+	p         float64 // probability of false positives
+	m         uint64  // number of bits
+	k         uint64  // number of hash functions
+	retention uint64
 
+	// mu     *sync.RWMutex
+	// prevMu *sync.RWMutex
+	//
 	pool    *sync.Pool
 	hashers []hash.Hash64
 
-	tbfs      []*tbf
-	retention uint64
-	term      struct {
-		latest   uint64
+	tbfs []*TBF
+	term struct {
 		earliest uint64
+		latest   uint64
 	}
-}
-
-type tbf struct {
-	t  uint64
-	bf *bf
 }
 
 func NewTermWindowedBloomFilter(n uint64, p float64, retention uint64) *TermWindowedBloomFilter {
 	m, k := getMKFromNP(n, p)
 
-	tbfs := make([]*tbf, retention)
+	tbfs := make([]*TBF, retention)
 	for i := range tbfs {
-		tbfs[i] = &tbf{
-			t:  uint64(i),
-			bf: newBF(m),
+		tbfs[i] = &TBF{
+			term: uint64(i),
+			cap:  n,
+			bf:   newBF(m),
 		}
 	}
 
 	return &TermWindowedBloomFilter{
-		n: n,
-		p: p,
-		m: m,
-		k: k,
-
+		n:         n,
+		p:         p,
+		m:         m,
+		k:         k,
+		retention: retention,
+		//
+		// mu:     &sync.RWMutex{},
+		// prevMu: &sync.RWMutex{},
+		//
 		pool: &sync.Pool{
 			New: func() interface{} {
 				return make([]uint64, k)
@@ -52,8 +54,7 @@ func NewTermWindowedBloomFilter(n uint64, p float64, retention uint64) *TermWind
 		},
 		hashers: getMurmur3Hashers(k),
 
-		tbfs:      tbfs,
-		retention: retention,
+		tbfs: tbfs,
 	}
 }
 
@@ -73,104 +74,97 @@ func (f *TermWindowedBloomFilter) K() uint64 {
 	return f.k
 }
 
-func (f *TermWindowedBloomFilter) Term() uint64 {
-	return f.term.latest
-}
-
 func (f *TermWindowedBloomFilter) Retention() uint64 {
 	return f.retention
+}
+
+func (f *TermWindowedBloomFilter) TBFS() []*TBF {
+	return f.tbfs
+}
+
+func (f *TermWindowedBloomFilter) Terms() (uint64, uint64) {
+	return f.term.earliest, f.term.latest
+}
+
+func (f *TermWindowedBloomFilter) SetTerms(earliest, latest uint64) {
+	f.term.earliest = earliest
+	f.term.latest = latest
 }
 
 func (f *TermWindowedBloomFilter) Set(key []byte) bool {
 	return f.set(key)
 }
 
-func (f *TermWindowedBloomFilter) SetWithTerm(term uint64, key []byte) (bool, error) {
-	if err := f.updateTerm(term); err != nil {
-		return false, err
-	}
-
-	return f.set(key), nil
-}
-
 func (f *TermWindowedBloomFilter) set(key []byte) bool {
 	hashes := f.generateHashes(key)
-	defer f.poolHashes(hashes)
+	defer f.releaseHashes(hashes)
 
+	// f.prevMu.RLock()
 	for i := f.term.earliest; i < f.term.latest; i++ {
-		tbf := f.getTBF(i)
-		if tbf.t == i && tbf.bf.check(hashes) {
+		tbf := f.tbf(i)
+		if tbf.term == i && tbf.bf.check(hashes) {
+			// f.prevMu.RUnlock()
 			return true
 		}
 	}
+	// f.prevMu.RUnlock()
 
-	return f.getTBF(f.term.latest).bf.set(hashes)
+	// f.mu.Lock()
+	tbf := f.tbf(f.term.latest)
+	exists := tbf.bf.set(hashes)
+	if !exists {
+		tbf.cap--
+		if tbf.cap == 0 {
+			// f.prevMu.Lock()
+			f.increaseTerm()
+			// f.prevMu.Unlock()
+		}
+	}
+	// f.mu.Unlock()
+
+	return exists
 }
 
 func (f *TermWindowedBloomFilter) Check(key []byte) bool {
 	return f.check(key)
 }
 
-func (f *TermWindowedBloomFilter) CheckWithTerm(term uint64, key []byte) (bool, error) {
-	if err := f.updateTerm(term); err != nil {
-		return false, err
-	}
-
-	return f.check(key), nil
-}
-
 func (f *TermWindowedBloomFilter) check(key []byte) bool {
 	hashes := f.generateHashes(key)
-	defer f.poolHashes(hashes)
+	defer f.releaseHashes(hashes)
 
-	for i := f.term.latest; i >= f.term.earliest; i-- {
-		tbf := f.getTBF(i)
-		if tbf.t == i && tbf.bf.check(hashes) {
+	// f.prevMu.RLock()
+	for i := f.term.earliest; i < f.term.latest; i++ {
+		tbf := f.tbf(i)
+		if tbf.term == i && tbf.bf.check(hashes) {
+			// f.prevMu.RUnlock()
 			return true
 		}
 	}
+	// f.prevMu.RUnlock()
 
-	return false
+	// f.mu.RLock()
+	exists := f.tbf(f.term.latest).bf.check(hashes)
+	// f.mu.RUnlock()
+
+	return exists
 }
 
-func (f *TermWindowedBloomFilter) UpdateTerm(term uint64) error {
-	return f.updateTerm(term)
-}
+func (f *TermWindowedBloomFilter) increaseTerm() {
+	_ = saveSnapshot(f.tbf(f.term.latest))
 
-type ExpiredTermError struct {
-	current uint64
-	given   uint64
-}
-
-func (e *ExpiredTermError) Error() string {
-	return fmt.Sprintf("expired latestTerm: '%d', but given '%d'", e.current, e.given)
-}
-
-func (f *TermWindowedBloomFilter) updateTerm(term uint64) error {
-	if term == f.term.latest {
-		return nil
-	}
-
-	if term < f.term.latest {
-		return &ExpiredTermError{
-			current: f.term.latest,
-			given:   term,
-		}
-	}
-
-	f.term.latest = term
+	f.term.latest++
 	if (f.retention - 1) <= f.term.latest {
 		f.term.earliest = f.term.latest - (f.retention - 1)
 	}
 
-	tbf := f.getTBF(f.term.latest)
-	tbf.t = f.term.latest
+	tbf := f.tbf(f.term.latest)
+	tbf.term = f.term.latest
 	tbf.bf.reset()
-
-	return nil
+	tbf.cap = f.n
 }
 
-func (f *TermWindowedBloomFilter) getTBF(term uint64) *tbf {
+func (f *TermWindowedBloomFilter) tbf(term uint64) *TBF {
 	return f.tbfs[term%f.retention]
 }
 
@@ -185,6 +179,6 @@ func (f *TermWindowedBloomFilter) generateHashes(key []byte) []uint64 {
 	return hashes
 }
 
-func (f *TermWindowedBloomFilter) poolHashes(hashes []uint64) {
+func (f *TermWindowedBloomFilter) releaseHashes(hashes []uint64) {
 	f.pool.Put(hashes)
 }

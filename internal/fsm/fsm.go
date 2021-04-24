@@ -1,6 +1,8 @@
 package fsm
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,14 +15,14 @@ import (
 )
 
 type FSM struct {
-	mu *sync.RWMutex
-	bf *bloomfilter.BloomFilter
+	mu   *sync.RWMutex
+	twbf *bloomfilter.TermWindowedBloomFilter
 }
 
-func New(n uint64, p float64) *FSM {
+func New(n uint64, p float64, retention uint64) *FSM {
 	return &FSM{
-		mu: &sync.RWMutex{},
-		bf: bloomfilter.New(n, p),
+		mu:   &sync.RWMutex{},
+		twbf: bloomfilter.NewTermWindowedBloomFilter(n, p, retention),
 	}
 }
 
@@ -42,33 +44,77 @@ func (m *FSM) Apply(l *raft.Log) interface{} {
 }
 
 func (m *FSM) Snapshot() (raft.FSMSnapshot, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	var (
-		src = m.bf.Bytes()
-		dst = make([]byte, len(src))
+		tbfs             = m.twbf.TBFS()
+		earliest, latest = m.twbf.Terms()
+		curr             = bytes.NewBuffer(nil)
 	)
-	copy(dst, src)
+	for _, tbf := range tbfs {
+		if tbf.Term() < latest {
+			err := saveSnapshot(tbf)
+			if err != nil {
+				return nil, err
+			}
+		} else if tbf.Term() == latest {
+			err := tbf.Snapshot(curr)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 
 	return &Snapshot{
-		b: dst,
+		header: SnapshotHeader{
+			Latest:   latest,
+			Earliest: earliest,
+		},
+		b: curr.Bytes(),
 	}, nil
 }
 
 func (m *FSM) Restore(rc io.ReadCloser) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer rc.Close()
 
-	_, err := io.ReadFull(rc, m.bf.Bytes())
-	return err
+	br := bufio.NewReader(rc)
+
+	b, err := br.ReadBytes('\n')
+	if err != nil {
+		return err
+	}
+	_, err = br.Discard(1)
+	if err != nil {
+		return err
+	}
+
+	var header SnapshotHeader
+	err = json.Unmarshal(b, &header)
+	if err != nil {
+		return err
+	}
+
+	m.twbf.SetTerms(header.Earliest, header.Latest)
+
+	tbfs := m.twbf.TBFS()
+	for i := header.Earliest; i <= header.Latest; i++ {
+		tbf := tbfs[i%m.twbf.Retention()]
+		if i < header.Latest {
+			err = restoreSnapshot(i, tbf)
+			if err != nil {
+				return err
+			}
+		} else if i == header.Latest {
+			err = tbf.Restore(br)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 func (m *FSM) Check(key string) bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	return m.bf.Check([]byte(key))
+	return m.twbf.Check([]byte(key))
 }
 
 func (m *FSM) opSet(msg Message) interface{} {
@@ -76,10 +122,7 @@ func (m *FSM) opSet(msg Message) interface{} {
 		return errors.New("invalid arguments")
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	return m.bf.Set([]byte(msg.Args[0]))
+	return m.twbf.Set([]byte(msg.Args[0]))
 }
 
 func (m *FSM) opCheck(msg Message) interface{} {
@@ -87,8 +130,5 @@ func (m *FSM) opCheck(msg Message) interface{} {
 		return errors.New("invalid arguments")
 	}
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	return m.bf.Check([]byte(msg.Args[0]))
+	return m.twbf.Check([]byte(msg.Args[0]))
 }

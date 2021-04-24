@@ -1,32 +1,25 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
+	"context"
 	"fmt"
-	"net/http"
+
+	"github.com/go-redis/redis/v8"
+	"github.com/tidwall/redcon"
 )
 
-type JoinMessage struct {
-	NodeID string `json:"id"`
-	Addr   string `json:"addr"`
+func joinCluster(nodeID string, addr string, joinAddr string) error {
+	c := redis.NewClient(&redis.Options{
+		Addr:         joinAddr,
+		MaxRetries:   -1,
+		ReadTimeout:  -1,
+		WriteTimeout: -1,
+	})
+	defer c.Close()
+
+	return c.Do(context.TODO(), "join", nodeID, addr).Err()
 }
 
-func JoinCluster(nodeID string, addr string, joinAddr string) error {
-	b, err := json.Marshal(JoinMessage{
-		NodeID: nodeID,
-		Addr:   addr,
-	})
-	if err != nil {
-		return err
-	}
-
-	url := fmt.Sprintf("http://%s/join", joinAddr)
-	resp, err := http.Post(url, "application-type/json", bytes.NewReader(b))
-	if err != nil {
-		return fmt.Errorf("cannot join cluster: %v", err)
-	}
-	defer resp.Body.Close()
-
-	return nil
+func writeInvalidArgumentsErr(conn redcon.Conn, cmd redcon.Command) {
+	conn.WriteError(fmt.Sprintf("ERR wrong number of arguments for '%s' command", cmd.Args[0]))
 }

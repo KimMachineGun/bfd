@@ -1,50 +1,11 @@
-package fsm
+package bloomfilter
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path"
-
-	"github.com/hashicorp/raft"
-
-	"github.com/KimMachineGun/bloomfilterd/internal/bloomfilter"
 )
-
-type Snapshot struct {
-	header SnapshotHeader
-	b      []byte
-}
-
-type SnapshotHeader struct {
-	Latest   uint64
-	Earliest uint64
-}
-
-func (s Snapshot) Persist(sink raft.SnapshotSink) error {
-	err := json.NewEncoder(sink).Encode(s.header)
-	if err != nil {
-		sink.Cancel()
-		return err
-	}
-
-	_, err = sink.Write([]byte{'\n'})
-	if err != nil {
-		sink.Cancel()
-		return err
-	}
-
-	_, err = sink.Write(s.b)
-	if err != nil {
-		sink.Cancel()
-		return err
-	}
-
-	return sink.Close()
-}
-
-func (s Snapshot) Release() {}
 
 const snapshotBase = "/Users/kimmachinegun/Desktop/Programming/bloomfilterd/snapshots"
 
@@ -62,7 +23,7 @@ func snapshotExists(term uint64) bool {
 	return !info.IsDir()
 }
 
-func saveSnapshot(tbf *bloomfilter.TBF) error {
+func saveSnapshot(tbf *TBF) error {
 	if snapshotExists(tbf.Term()) {
 		return nil
 	}
@@ -76,7 +37,7 @@ func saveSnapshot(tbf *bloomfilter.TBF) error {
 	return tbf.Snapshot(f)
 }
 
-func restoreSnapshot(term uint64, tbf *bloomfilter.TBF) error {
+func restoreSnapshot(term uint64, tbf *TBF) error {
 	if !snapshotExists(term) {
 		return errors.New("snapshot not exists")
 	}

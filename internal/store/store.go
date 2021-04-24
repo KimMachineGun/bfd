@@ -16,8 +16,9 @@ import (
 )
 
 type Config struct {
-	N uint64
-	P float64
+	N         uint64
+	P         float64
+	Retention uint64
 
 	NodeID           string
 	Addr             string
@@ -41,7 +42,7 @@ type Store struct {
 }
 
 func New(c *Config) (*Store, error) {
-	bf := fsm.New(c.N, c.P)
+	bf := fsm.New(c.N, c.P, c.Retention)
 
 	raftConfig := raft.DefaultConfig()
 	raftConfig.LocalID = raft.ServerID(c.NodeID)
@@ -111,7 +112,7 @@ func (s *Store) Join(nodeID string, addr string) error {
 
 	for _, srv := range configFuture.Configuration().Servers {
 		if srv.ID == raft.ServerID(nodeID) || srv.Address == raft.ServerAddress(addr) {
-			return fmt.Errorf("give node already member of cluster")
+			return fmt.Errorf("given node already member of cluster")
 		}
 	}
 
